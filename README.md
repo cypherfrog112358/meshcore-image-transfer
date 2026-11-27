@@ -32,6 +32,12 @@ Drei Tempomaßnahmen sind jetzt Standard:
 
 Einzel-ACK pro Paket (`--ack`) ist langsamer und deshalb standardmäßig aus.
 
+**Sendetabelle:** Die Firmware hält nur eine begrenzte Anzahl gesendeter DMs
+offen, bis der Empfänger sie auf Funk ebene bestätigt. Zu schnelles Senden
+liefert `ERR_CODE_TABLE_FULL`. `mcimg` erkennt das, erhöht die Pause automatisch
+auf `--table-full-wait` (Standard 1 s) und sendet das Paket erneut. Dadurch ist
+eine Pause von 0 ms nicht immer schneller als 50 ms.
+
 ## Installation
 
 Windows, PowerShell, im Projektordner:
@@ -179,6 +185,9 @@ Wichtige Optionen:
 | `--repair` / `--no-repair` | Fehlende Pakete per Rückfrage erneut senden (Standard an) |
 | `--repair-wait S` | Max. Wartezeit auf die Rückmeldung (Standard 15 s) |
 | `--repair-rounds N` | Reparaturrunden pro Block (Standard 2) |
+| `--table-full-wait S` | Pause bei voller Sendetabelle (Standard 1 s) |
+| `--table-full-retries N` | Versuche bei voller Sendetabelle (Standard 10) |
+| `--table-full-max-wait S` | Maximale adaptations-Pause (Standard 10 s) |
 | `--ack` | Einzel-ACK pro Paket (langsam, Standard aus) |
 | `--gap-ms` | Pause zwischen Nachrichten, Standard 50 |
 | `--manifest-repeat` | Manifest 3× senden, damit der Empfänger es sicher hat |

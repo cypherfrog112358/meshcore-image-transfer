@@ -1,13 +1,18 @@
 import argparse
+import asyncio
 import io
 import random
 import struct
 import tempfile
+import types
 import unittest
 from dataclasses import replace
 from pathlib import Path
 from PIL import Image
+from meshcore import EventType
+from meshcore.events import Event
 
+import mcimg
 import mcimg_palette as palette
 import mcimg_protocol as proto
 from mcimg import Receiver
@@ -249,6 +254,54 @@ class PaletteTests(unittest.TestCase):
         with Image.open(io.BytesIO(png)) as image:
             self.assertEqual(image.size, (width, height))
             self.assertLessEqual(len(image.convert("RGB").getcolors()), 5)
+
+
+class TableFullTests(unittest.TestCase):
+    def test_retry_on_table_full(self):
+        calls = 0
+
+        async def send_msg(_contact, _text):
+            nonlocal calls
+            calls += 1
+            if calls <= 2:
+                return Event(
+                    EventType.ERROR,
+                    {"error_code": 3, "code_string": "ERR_CODE_TABLE_FULL"},
+                )
+            return Event(EventType.MSG_SENT, {"expected_ack": b"\x01"})
+
+        args = argparse.Namespace(
+            transport="fake",
+            ack=False,
+            retries=3,
+            table_full_wait=0.01,
+            table_full_retries=5,
+        )
+        mc = types.SimpleNamespace(
+            commands=types.SimpleNamespace(send_msg=send_msg)
+        )
+        self.assertTrue(asyncio.run(mcimg.send_text(mc, object(), args, "I1:D:x")))
+        self.assertEqual(calls, 3)
+        self.assertGreaterEqual(args._table_pause, 0.2)
+
+    def test_table_full_gives_up(self):
+        async def send_msg(_contact, _text):
+            return Event(
+                EventType.ERROR,
+                {"error_code": 3, "code_string": "ERR_CODE_TABLE FULL"},
+            )
+
+        args = argparse.Namespace(
+            transport="fake",
+            ack=False,
+            retries=3,
+            table_full_wait=0.01,
+            table_full_retries=3,
+        )
+        mc = types.SimpleNamespace(
+            commands=types.SimpleNamespace(send_msg=send_msg)
+        )
+        self.assertFalse(asyncio.run(mcimg.send_text(mc, object(), args, "hi")))
 
 
 if __name__ == "__main__":

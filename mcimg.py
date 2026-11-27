@@ -119,8 +119,17 @@ async def resolve_contact(mc, dest: str):
     return contact
 
 
+def _is_table_full(payload) -> bool:
+    """Recognise ERR_CODE_TABLE_FULL in the different firmware spellings."""
+    if isinstance(payload, dict):
+        if payload.get("error_code") == 3 or payload.get("error code") == 3:
+            return True
+    text = str(payload).lower()
+    return any(part in text for part in ("table_full", "table full", "table-full"))
+
+
 async def send_text(mc, contact, args: argparse.Namespace, text: str) -> bool:
-    """Send one text message. Returns True on success."""
+    """Send one text message, retrying when the radio's send table is full."""
     if args.transport == "mock":
         with open(args.target, "a", encoding="utf-8") as handle:
             handle.write(json.dumps({"t": time.time(), "text": text}) + "\n")
@@ -128,20 +137,50 @@ async def send_text(mc, contact, args: argparse.Namespace, text: str) -> bool:
 
     from meshcore import EventType
 
-    try:
-        if args.ack:
-            result = await mc.commands.send_msg_with_retry(
-                contact, text, max_attempts=args.retries
-            )
-            return result is not None and not result.is_error()
-        result = await mc.commands.send_msg(contact, text)
-        if result.type == EventType.ERROR:
+    wait = max(0.2, float(getattr(args, "table_full_wait", 1.0)))
+    attempts = max(1, int(getattr(args, "table_full_retries", 10)))
+
+    for attempt in range(attempts):
+        try:
+            if args.ack:
+                result = await mc.commands.send_msg_with_retry(
+                    contact, text, max_attempts=args.retries
+                )
+                if result is not None and not result.is_error():
+                    return True
+                if attempt + 1 < attempts:
+                    await asyncio.sleep(wait)
+                    continue
+                log("  FEHLER beim Senden: keine ACK-Bestaetigung erhalten")
+                return False
+
+            result = await mc.commands.send_msg(contact, text)
+            if result.type != EventType.ERROR:
+                return True
+            if _is_table_full(result.payload) and attempt + 1 < attempts:
+                current = float(getattr(args, "_table_pause", 0.0))
+                new_pause = max(wait, current * 1.5)
+                new_pause = min(
+                    new_pause, max(wait, float(getattr(args, "table_full_max_wait", 10.0)))
+                )
+                if new_pause > current:
+                    args._table_pause = new_pause
+                    log(f"  Sendetabelle voll - Pause auf {new_pause:g}s erhoeht")
+                await asyncio.sleep(max(wait, new_pause))
+                continue
             log(f"  FEHLER beim Senden: {result.payload}")
             return False
-        return True
-    except Exception as exc:  # noqa: BLE001 - radio APIs raise many types
-        log(f"  FEHLER beim Senden: {exc}")
-        return False
+        except Exception as exc:  # noqa: BLE001 - radio APIs raise many types
+            log(f"  FEHLER beim Senden: {exc}")
+            return False
+    return False
+
+
+async def _pace(args: argparse.Namespace) -> None:
+    """Pause between messages, including backpressure from a full send table."""
+    delay = max(args.gap_ms / 1000, float(getattr(args, "_table_pause", 0.0)))
+    if delay > 0:
+        await asyncio.sleep(delay)
 
 
 # --------------------------------------------------------------------------- #
@@ -249,10 +288,10 @@ async def send_prepared(
 
     async def send_one(seq: int) -> bool:
         ok = await send_text(mc, contact, args, messages[seq])
-        if args.gap_ms:
-            await asyncio.sleep(args.gap_ms / 1000)
+        await _pace(args)
         return ok
 
+    args._table_pause = 0.0
     try:
         for _ in range(args.manifest_repeat):
             if cancelled and cancelled():
@@ -262,8 +301,7 @@ async def send_prepared(
                 mc, contact, args, proto.encode_manifest(manifest, args.max_chars)
             ):
                 log("  Manifest konnte nicht gesendet werden.")
-            if args.gap_ms:
-                await asyncio.sleep(args.gap_ms / 1000)
+            await _pace(args)
 
         seq = 0
         while not stopped and seq < len(messages):
@@ -778,6 +816,24 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=2,
         help="Reparaturrunden pro Block (Standard: 2)",
+    )
+    send.add_argument(
+        "--table-full-wait",
+        type=float,
+        default=1.0,
+        help="Pause bei ERR_CODE_TABLE_FULL in Sekunden (Standard: 1)",
+    )
+    send.add_argument(
+        "--table-full-retries",
+        type=int,
+        default=10,
+        help="Versuche bei voller Sendetabelle (Standard: 10)",
+    )
+    send.add_argument(
+        "--table-full-max-wait",
+        type=float,
+        default=10.0,
+        help="Maximale Pause bei voller Sendetabelle (Standard: 10 s)",
     )
     send.add_argument("--ack", action="store_true", help="Auf ACK warten und erneut senden")
     send.add_argument("--retries", type=int, default=3, help="Versuche pro Paket mit --ack")

@@ -245,6 +245,9 @@ class App:
         args.repair = True
         args.repair_wait = 15.0
         args.repair_rounds = 2
+        args.table_full_wait = 1.0
+        args.table_full_retries = 10
+        args.table_full_max_wait = 10.0
         args.dither = self.dither_var.get()
         if args.dither not in palette.DITHER_MODES:
             args.dither = "floyd"
