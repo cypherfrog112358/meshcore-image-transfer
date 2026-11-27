@@ -304,5 +304,76 @@ class TableFullTests(unittest.TestCase):
         self.assertFalse(asyncio.run(mcimg.send_text(mc, object(), args, "hi")))
 
 
+class FinalRepairTests(unittest.TestCase):
+    def test_bad_checksum_is_repaired_after_last_packet(self):
+        data = bytes((i * 17) % 256 for i in range(700))
+        manifest = proto.make_manifest(data, "frame.mc4")
+        messages = proto.make_data_messages(data, manifest)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            args = argparse.Namespace(
+                out=tmp,
+                id=None,
+                report_every=10**9,
+                save_every=10**9,
+                transport="fake",
+                ack=False,
+                retries=3,
+                max_chars=proto.MAX_CHARS,
+                gap_ms=0,
+                pipeline=8,
+                repair=True,
+                repair_wait=0.1,
+                repair_rounds=2,
+                manifest_repeat=1,
+                limit=None,
+                table_full_wait=0.01,
+                table_full_retries=5,
+            )
+            receiver = Receiver(args)
+            state = {"subscribers": [], "corrupt": True}
+
+            def deliver(text):
+                for callback in list(state["subscribers"]):
+                    callback(types.SimpleNamespace(payload={"text": text}))
+
+            async def send_msg(_contact, text):
+                parsed = proto.parse_message(text)
+                if isinstance(parsed, (proto.Manifest, proto.DataChunk)):
+                    if (
+                        isinstance(parsed, proto.DataChunk)
+                        and parsed.seq == 3
+                        and state["corrupt"]
+                    ):
+                        state["corrupt"] = False
+                        body = (
+                            f"I1:D:{parsed.transfer_id}:{proto.b36(parsed.seq)}:"
+                        )
+                        damaged = bytes([parsed.data[0] ^ 0xFF]) + parsed.data[1:]
+                        receiver.handle(body + proto.b64encode(damaged))
+                    else:
+                        receiver.handle(text)
+                elif isinstance(parsed, proto.Query):
+                    missing = [
+                        seq
+                        for seq in range(parsed.start, parsed.end + 1)
+                        if seq not in receiver.chunks
+                    ]
+                    deliver(proto.encode_repair(parsed.transfer_id, missing))
+                return types.SimpleNamespace(type=EventType.MSG_SENT, payload={})
+
+            mc = types.SimpleNamespace(
+                commands=types.SimpleNamespace(send_msg=send_msg),
+                subscribe=lambda _event, cb: state["subscribers"].append(cb) or cb,
+                unsubscribe=lambda cb: state["subscribers"].remove(cb),
+            )
+            receiver.feedback = deliver
+            receiver.handle(proto.encode_manifest(manifest))
+            code = asyncio.run(mcimg.send_prepared(mc, object(), args, manifest, messages))
+
+        self.assertEqual(code, 0)
+        self.assertIn(manifest.transfer_id, receiver.completed_ids)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -196,7 +196,9 @@ Wichtige Optionen:
 
 Der Transfer ist abgeschlossen, wenn der Empfänger „EMPFANGEN: ..." meldet.
 Der SHA-256 bleibt das letzte Sicherheitsnetz: Stimmt er nach vollständigem
-Empfang nicht, fordert der Empfänger einmalig alle Pakete erneut an.
+Empfang nicht, fordert der Empfänger alle Pakete erneut an. Damit das auch nach
+dem letzten Block noch ankommt, fragt der Sender nach dem Versand aktiv beim
+Empfänger nach und wiederholt fehlende Pakete.
 
 Wichtig: Sender **und** Empfänger müssen diese Version verwenden, sonst kennt
 der Empfänger die Rückfragen nicht. Der Sender merkt das nach einem Block und

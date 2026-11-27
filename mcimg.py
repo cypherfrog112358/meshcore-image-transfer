@@ -266,7 +266,7 @@ async def send_prepared(
     )
     repair_wait = max(0.0, float(getattr(args, "repair_wait", 15)))
     repair_rounds = max(1, int(getattr(args, "repair_rounds", 2)))
-    replies: dict[str, proto.Repair] = {}
+    replies: dict[str, object] = {}
     subscription = None
 
     if repair_active:
@@ -283,6 +283,7 @@ async def send_prepared(
                 and parsed.transfer_id == manifest.transfer_id
             ):
                 replies["value"] = parsed
+                replies.setdefault("all", []).append(parsed)
 
         subscription = mc.subscribe(EventType.CONTACT_MSG_RECV, on_reply)
 
@@ -322,7 +323,7 @@ async def send_prepared(
             # receiver once per block which packets it actually missed.
             if repair_active:
                 for _round in range(repair_rounds):
-                    replies.pop("value", None)
+                    replies.clear()
                     query = proto.encode_query(manifest.transfer_id, seq, batch_end - 1)
                     if not await send_text(mc, contact, args, query):
                         log("  Rueckfrage konnte nicht gesendet werden.")
@@ -373,6 +374,60 @@ async def send_prepared(
                     f"fehlgeschlagen: {len(unrepaired)})"
                 )
             seq = batch_end
+
+        # Final check: the receiver may only notice a bad SHA-256 after the
+        # last chunk, so keep listening for its repair request for a moment.
+        if repair_active and not stopped:
+            final_wait = max(repair_wait, 5.0)
+            for _round in range(max(repair_rounds, 2)):
+                replies.clear()
+                query = proto.encode_query(manifest.transfer_id, 0, len(messages) - 1)
+                if not await send_text(mc, contact, args, query):
+                    log("  Abschluss-Rueckfrage konnte nicht gesendet werden.")
+                    break
+
+                deadline = time.monotonic() + final_wait
+                first_reply = None
+                while time.monotonic() < deadline:
+                    if cancelled and cancelled():
+                        stopped = True
+                        break
+                    if replies.get("all") and first_reply is None:
+                        first_reply = time.monotonic()
+                    if first_reply is not None and time.monotonic() - first_reply >= 1.0:
+                        break
+                    await asyncio.sleep(0.2)
+                if stopped:
+                    break
+
+                answers = replies.get("all", [])
+                if not isinstance(answers, list) or not answers:
+                    log("  Keine Abschlussrueckmeldung empfangen.")
+                    break
+
+                if any(answer.resend_all for answer in answers):
+                    targets = set(range(len(messages)))
+                else:
+                    targets = {
+                        seq
+                        for answer in answers
+                        for seq in answer.missing
+                        if 0 <= seq < len(messages)
+                    }
+                targets |= unrepaired
+                if not targets:
+                    log("  Abschluss-Pruefung: Empfaenger hat alle Pakete.")
+                    break
+
+                log(f"  Abschluss-Pruefung: {len(targets)} Pakete fehlen - erneut senden")
+                for target in sorted(targets):
+                    if cancelled and cancelled():
+                        stopped = True
+                        break
+                    if await send_one(target):
+                        unrepaired.discard(target)
+                    else:
+                        unrepaired.add(target)
     finally:
         if subscription is not None and mc is not None:
             mc.unsubscribe(subscription)
