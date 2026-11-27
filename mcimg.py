@@ -258,18 +258,26 @@ async def send_prepared(
     unrepaired: set[int] = set()
     stopped = False
     pipeline = max(1, int(getattr(args, "pipeline", 1)))
-    repair_active = (
+    # Feedback may be unavailable for a few blocks (slow receiver, lost reply,
+    # old firmware). Never let that switch off the final completeness check.
+    feedback_enabled = (
         pipeline > 1
         and bool(getattr(args, "repair", True))
         and mc is not None
         and contact is not None
     )
-    repair_wait = max(0.0, float(getattr(args, "repair_wait", 15)))
+    block_repair_enabled = feedback_enabled
+    no_reply_streak = 0
+    no_reply_limit = 2
+    repair_wait = max(0.0, float(getattr(args, "repair_wait", 30)))
     repair_rounds = max(1, int(getattr(args, "repair_rounds", 2)))
     replies: dict[str, object] = {}
+    # Repairs that arrive unsolicited (e.g. a bad SHA-256 at the last packet)
+    # must survive the replies.clear() done for every individual query.
+    pending_feedback: list[proto.Repair] = []
     subscription = None
 
-    if repair_active:
+    if feedback_enabled:
         from meshcore import EventType
 
         def on_reply(event) -> None:
@@ -284,6 +292,7 @@ async def send_prepared(
             ):
                 replies["value"] = parsed
                 replies.setdefault("all", []).append(parsed)
+                pending_feedback.append(parsed)
 
         subscription = mc.subscribe(EventType.CONTACT_MSG_RECV, on_reply)
 
@@ -321,7 +330,7 @@ async def send_prepared(
 
             # Instead of waiting for an ACK after every packet, ask the
             # receiver once per block which packets it actually missed.
-            if repair_active:
+            if block_repair_enabled:
                 for _round in range(repair_rounds):
                     replies.clear()
                     query = proto.encode_query(manifest.transfer_id, seq, batch_end - 1)
@@ -337,11 +346,25 @@ async def send_prepared(
                         break
 
                     reply = replies.pop("value", None)
+                    if reply is not None:
+                        try:
+                            pending_feedback.remove(reply)
+                        except ValueError:
+                            pass
                     if reply is None:
-                        log("  Keine Reparaturrueckmeldung - Pipeline ohne Rueckkanal.")
-                        repair_active = False
+                        no_reply_streak += 1
+                        log(
+                            "  Keine Reparaturrueckmeldung fuer diesen Block "
+                            f"({no_reply_streak}/{no_reply_limit})."
+                        )
+                        if no_reply_streak >= no_reply_limit:
+                            log(
+                                "  Block-Rueckfragen aus - Abschluss-Pruefung bleibt aktiv."
+                            )
+                            block_repair_enabled = False
                         break
 
+                    no_reply_streak = 0
                     if reply.resend_all:
                         targets = set(range(seq, batch_end))
                     else:
@@ -376,9 +399,18 @@ async def send_prepared(
             seq = batch_end
 
         # Final check: the receiver may only notice a bad SHA-256 after the
-        # last chunk, so keep listening for its repair request for a moment.
-        if repair_active and not stopped:
-            final_wait = max(repair_wait, 5.0)
+        # last chunk, or it may have resumed from an old progress file. This
+        # phase must run even when all block queries stayed unanswered.
+        if feedback_enabled and not stopped:
+            final_wait = max(
+                repair_wait, float(getattr(args, "_final_wait_floor", 5.0))
+            )
+            if not await send_text(
+                mc, contact, args, proto.encode_manifest(manifest, args.max_chars)
+            ):
+                log("  Manifest vor Abschluss-Pruefung konnte nicht gesendet werden.")
+            await _pace(args)
+
             for _round in range(max(repair_rounds, 2)):
                 replies.clear()
                 query = proto.encode_query(manifest.transfer_id, 0, len(messages) - 1)
@@ -387,21 +419,23 @@ async def send_prepared(
                     break
 
                 deadline = time.monotonic() + final_wait
+                quiet = float(getattr(args, "_reply_quiet", 1.0))
                 first_reply = None
                 while time.monotonic() < deadline:
                     if cancelled and cancelled():
                         stopped = True
                         break
-                    if replies.get("all") and first_reply is None:
+                    if (replies.get("all") or pending_feedback) and first_reply is None:
                         first_reply = time.monotonic()
-                    if first_reply is not None and time.monotonic() - first_reply >= 1.0:
+                    if first_reply is not None and time.monotonic() - first_reply >= quiet:
                         break
-                    await asyncio.sleep(0.2)
+                    await asyncio.sleep(0.05)
                 if stopped:
                     break
 
-                answers = replies.get("all", [])
-                if not isinstance(answers, list) or not answers:
+                answers = list(pending_feedback)
+                pending_feedback.clear()
+                if not answers:
                     log("  Keine Abschlussrueckmeldung empfangen.")
                     break
 
@@ -863,8 +897,8 @@ def build_parser() -> argparse.ArgumentParser:
     send.add_argument(
         "--repair-wait",
         type=float,
-        default=15.0,
-        help="Max. Wartezeit auf eine Reparaturantwort in Sekunden",
+        default=30.0,
+        help="Max. Wartezeit auf eine Reparaturantwort in Sekunden (Standard: 30)",
     )
     send.add_argument(
         "--repair-rounds",

@@ -24,6 +24,18 @@ def receiver_for(directory: str, **overrides):
     return Receiver(argparse.Namespace(out=directory, **values))
 
 
+def data_with_chunks(count: int):
+    """Build deterministic data that produces exactly ``count`` packets."""
+    length = count * 80 + 1
+    for _ in range(2000):
+        data = bytes((i * 29 + 11) % 256 for i in range(length))
+        manifest = proto.make_manifest(data, "x.bin")
+        if manifest.chunks == count:
+            return data, manifest, proto.make_data_messages(data, manifest)
+        length += 1 if manifest.chunks < count else -1
+    raise AssertionError(f"konnte {count} Pakete nicht erreichen")
+
+
 class ProtocolTests(unittest.TestCase):
     def test_chunk_size_and_roundtrip(self):
         rng = random.Random(42)
@@ -373,6 +385,144 @@ class FinalRepairTests(unittest.TestCase):
 
         self.assertEqual(code, 0)
         self.assertIn(manifest.transfer_id, receiver.completed_ids)
+
+    def test_resume_with_silent_block_queries_is_repaired(self):
+        data, manifest, messages = data_with_chunks(81)
+        with tempfile.TemporaryDirectory() as tmp:
+            # Previous attempt left 54 packets in the hidden progress file.
+            seed = receiver_for(tmp, save_every=1)
+            seed.handle(proto.encode_manifest(manifest))
+            for text in messages[:54]:
+                seed.handle(text)
+            self.assertTrue((Path(tmp) / manifest.progress_name).is_file())
+
+            args = argparse.Namespace(
+                out=tmp,
+                id=None,
+                report_every=10**9,
+                save_every=10**9,
+                transport="fake",
+                ack=False,
+                retries=3,
+                max_chars=proto.MAX_CHARS,
+                gap_ms=0,
+                pipeline=8,
+                repair=True,
+                repair_wait=0.01,
+                repair_rounds=2,
+                manifest_repeat=1,
+                limit=None,
+                table_full_wait=0.01,
+                table_full_retries=5,
+                _final_wait_floor=0.05,
+                _reply_quiet=0.02,
+            )
+            receiver = receiver_for(tmp)
+            state = {
+                "subscribers": [],
+                "final_query": False,
+                "block_queries": 0,
+            }
+
+            def deliver(text):
+                for callback in list(state["subscribers"]):
+                    callback(types.SimpleNamespace(payload={"text": text}))
+
+            receiver.feedback = deliver
+
+            async def send_msg(_contact, text):
+                parsed = proto.parse_message(text)
+                if isinstance(parsed, proto.Manifest):
+                    receiver.handle(text)
+                elif isinstance(parsed, proto.DataChunk):
+                    # During the pipeline only duplicates arrive; the 27
+                    # missing packets are delivered after the final query.
+                    if state["final_query"] or parsed.seq < 54:
+                        receiver.handle(text)
+                elif isinstance(parsed, proto.Query):
+                    if parsed.start == 0 and parsed.end == manifest.chunks - 1:
+                        state["final_query"] = True
+                        receiver.handle(text)
+                    else:
+                        state["block_queries"] += 1  # receiver does not answer
+                return types.SimpleNamespace(type=EventType.MSG_SENT, payload={})
+
+            mc = types.SimpleNamespace(
+                commands=types.SimpleNamespace(send_msg=send_msg),
+                subscribe=lambda _event, cb: state["subscribers"].append(cb) or cb,
+                unsubscribe=lambda cb: state["subscribers"].remove(cb),
+            )
+            code = asyncio.run(mcimg.send_prepared(mc, object(), args, manifest, messages))
+
+            self.assertEqual(code, 0)
+            self.assertEqual(state["block_queries"], 2)
+            self.assertIn(manifest.transfer_id, receiver.completed_ids)
+            self.assertEqual((Path(tmp) / "x.bin").read_bytes(), data)
+            self.assertFalse((Path(tmp) / manifest.progress_name).exists())
+
+    def test_unsolicited_resend_all_survives_final_query(self):
+        data = bytes((i * 17) % 256 for i in range(700))
+        manifest = proto.make_manifest(data, "frame.bin")
+        messages = proto.make_data_messages(data, manifest)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            args = argparse.Namespace(
+                out=tmp,
+                id=None,
+                report_every=10**9,
+                save_every=10**9,
+                transport="fake",
+                ack=False,
+                retries=3,
+                max_chars=proto.MAX_CHARS,
+                gap_ms=0,
+                pipeline=8,
+                repair=True,
+                repair_wait=0.01,
+                repair_rounds=2,
+                manifest_repeat=1,
+                limit=None,
+                table_full_wait=0.01,
+                table_full_retries=5,
+                _final_wait_floor=0.05,
+                _reply_quiet=0.02,
+            )
+            receiver = Receiver(args)
+            state = {"subscribers": [], "corrupt": True}
+
+            def deliver(text):
+                for callback in list(state["subscribers"]):
+                    callback(types.SimpleNamespace(payload={"text": text}))
+
+            async def send_msg(_contact, text):
+                parsed = proto.parse_message(text)
+                if isinstance(parsed, proto.Manifest):
+                    receiver.handle(text)
+                elif isinstance(parsed, proto.DataChunk):
+                    if parsed.seq == 3 and state["corrupt"]:
+                        state["corrupt"] = False
+                        body = (
+                            f"I1:D:{parsed.transfer_id}:{proto.b36(parsed.seq)}:"
+                        )
+                        damaged = bytes([parsed.data[0] ^ 0xFF]) + parsed.data[1:]
+                        receiver.handle(body + proto.b64encode(damaged))
+                    else:
+                        receiver.handle(text)
+                elif isinstance(parsed, proto.Query):
+                    pass  # only the unsolicited resend_all can save this run
+                return types.SimpleNamespace(type=EventType.MSG_SENT, payload={})
+
+            mc = types.SimpleNamespace(
+                commands=types.SimpleNamespace(send_msg=send_msg),
+                subscribe=lambda _event, cb: state["subscribers"].append(cb) or cb,
+                unsubscribe=lambda cb: state["subscribers"].remove(cb),
+            )
+            receiver.feedback = deliver
+            code = asyncio.run(mcimg.send_prepared(mc, object(), args, manifest, messages))
+
+            self.assertEqual(code, 0)
+            self.assertIn(manifest.transfer_id, receiver.completed_ids)
+            self.assertEqual((Path(tmp) / "frame.bin").read_bytes(), data)
 
 
 if __name__ == "__main__":
