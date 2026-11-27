@@ -40,8 +40,8 @@ Danach immer `.\.venv\Scripts\python.exe mcimg.py ...` aufrufen.
 
 ### Auf einem zweiten Gerät (Empfänger)
 
-Das Repository ist **privat**. Auf dem anderen Windows-Gerät einmal mit Git
-klonen (Git Credential Manager öffnet bei Bedarf das Browser-Fenster):
+Das Repository ist **öffentlich**. Auf dem anderen Windows-Gerät einmal mit Git
+klonen – eine Anmeldung ist dafür nicht nötig:
 
 ```powershell
 git clone https://github.com/cypherfrog112358/meshcore-image-transfer.git
