@@ -359,8 +359,8 @@ class RadioSession:
         args = types.SimpleNamespace(
             out=out_dir,
             id=transfer_id or None,
-            report_every=10**9,
-            save_every=10**9,
+            report_every=25,
+            save_every=10,
         )
         receiver = mcimg.Receiver(args)
         self.reply_key = sender_key or None

@@ -32,6 +32,11 @@ Drei Tempomaßnahmen sind jetzt Standard:
 
 Einzel-ACK pro Paket (`--ack`) ist langsamer und deshalb standardmäßig aus.
 
+Nach dem letzten Paket folgt eine **Abschluss-Prüfung**: Der Sender fragt alle
+Pakete noch einmal ab und sendet fehlende gezielt erneut. Bleibt die letzte
+Bestätigung aus, warnt er ausdrücklich – dann bitte den Ausgabeordner auf dem
+Empfänger prüfen, statt sich auf „Fertig“ zu verlassen.
+
 **Sendetabelle:** Die Firmware hält nur eine begrenzte Anzahl gesendeter DMs
 offen, bis der Empfänger sie auf Funk ebene bestätigt. Zu schnelles Senden
 liefert `ERR_CODE_TABLE_FULL`. `mcimg` erkennt das, erhöht die Pause automatisch

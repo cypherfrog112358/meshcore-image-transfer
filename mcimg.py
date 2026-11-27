@@ -411,7 +411,9 @@ async def send_prepared(
                 log("  Manifest vor Abschluss-Pruefung konnte nicht gesendet werden.")
             await _pace(args)
 
-            for _round in range(max(repair_rounds, 2)):
+            unconfirmed_repair = False
+            final_confirmed = False
+            for _round in range(max(repair_rounds, 3)):
                 replies.clear()
                 query = proto.encode_query(manifest.transfer_id, 0, len(messages) - 1)
                 if not await send_text(mc, contact, args, query):
@@ -436,6 +438,9 @@ async def send_prepared(
                 answers = list(pending_feedback)
                 pending_feedback.clear()
                 if not answers:
+                    if unconfirmed_repair and not final_confirmed:
+                        log("  Keine Abschlussrueckmeldung - noch eine Rueckfrage ...")
+                        continue
                     log("  Keine Abschlussrueckmeldung empfangen.")
                     break
 
@@ -450,9 +455,11 @@ async def send_prepared(
                     }
                 targets |= unrepaired
                 if not targets:
+                    final_confirmed = True
                     log("  Abschluss-Pruefung: Empfaenger hat alle Pakete.")
                     break
 
+                unconfirmed_repair = True
                 log(f"  Abschluss-Pruefung: {len(targets)} Pakete fehlen - erneut senden")
                 for target in sorted(targets):
                     if cancelled and cancelled():
@@ -462,6 +469,12 @@ async def send_prepared(
                         unrepaired.discard(target)
                     else:
                         unrepaired.add(target)
+
+            if unconfirmed_repair and not final_confirmed:
+                log(
+                    "WARNUNG: Abschluss nicht bestaetigt - "
+                    "bitte Ausgabeordner auf dem Empfaenger pruefen."
+                )
     finally:
         if subscription is not None and mc is not None:
             mc.unsubscribe(subscription)
@@ -619,6 +632,10 @@ class Receiver:
             missing = [
                 seq for seq in range(parsed.start, end + 1) if seq not in self.chunks
             ]
+            log(
+                f"  Rueckfrage {parsed.start}-{end}: {len(missing)} Pakete fehlen "
+                "- antworte"
+            )
             self.feedback(proto.encode_repair(parsed.transfer_id, missing))
             return
 
