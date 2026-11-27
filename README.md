@@ -38,6 +38,24 @@ python -m venv .venv
 
 Danach immer `.\.venv\Scripts\python.exe mcimg.py ...` aufrufen.
 
+### Auf einem zweiten Gerät (Empfänger)
+
+Das Repository ist **privat**. Auf dem anderen Windows-Gerät einmal mit Git
+klonen (Git Credential Manager öffnet bei Bedarf das Browser-Fenster):
+
+```powershell
+git clone https://github.com/cypherfrog112358/meshcore-image-transfer.git
+cd meshcore-image-transfer
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+.\.venv\Scripts\python.exe mcimg_app.py
+```
+
+Dort dann auf **Verbindung** den Heltec aus der Geräteliste wählen und
+**Verbinden** klicken. Anschließend auf **Bilder** den Ausgabeordner setzen und
+**Empfang starten**. Der Absender braucht dasselbe Tool und denselben Empfänger
+als Kontakt. Es muss nur eine App gleichzeitig mit dem Heltec verbunden sein.
+
 ## Grafische Oberfläche
 
 Die Haupt-GUI ist `mcimg_app.py` und orientiert sich an der offiziellen
