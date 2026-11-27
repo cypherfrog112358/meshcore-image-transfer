@@ -433,7 +433,7 @@ class App:
             "gap_ms": 50,
             "pipeline": 8,
             "repair": True,
-            "repair_wait": 30,
+            "repair_wait": 60,
             "repair_rounds": 2,
             "retries": 3,
             "max_chars": proto.MAX_CHARS,
@@ -448,8 +448,8 @@ class App:
                     if stored.get("gap_ms") == 300:
                         stored["gap_ms"] = 50
                     stored["ack"] = False
-                if stored.get("repair_wait") == 15:
-                    stored["repair_wait"] = 30
+                if stored.get("repair_wait") in (15, 30):
+                    stored["repair_wait"] = 60
                 stored.pop("palette5", None)
                 defaults.update(stored)
         except (OSError, ValueError):
@@ -466,7 +466,7 @@ class App:
             "gap_ms": self._to_int(self.gap_var.get(), 50),
             "pipeline": self._to_int(self.pipeline_var.get(), 8),
             "repair": self.repair_var.get(),
-            "repair_wait": self._to_int(self.repair_wait_var.get(), 30),
+            "repair_wait": self._to_int(self.repair_wait_var.get(), 60),
             "repair_rounds": self._to_int(self.repair_rounds_var.get(), 2),
             "retries": self._to_int(self.retries_var.get(), 3),
             "max_chars": self._to_int(self.max_chars_var.get(), proto.MAX_CHARS),
@@ -1071,7 +1071,7 @@ class App:
             "gap_ms": self._to_int(self.gap_var.get(), 50),
             "pipeline": self._to_int(self.pipeline_var.get(), 8),
             "repair": self.repair_var.get(),
-            "repair_wait": self._to_int(self.repair_wait_var.get(), 30),
+            "repair_wait": self._to_int(self.repair_wait_var.get(), 60),
             "repair_rounds": self._to_int(self.repair_rounds_var.get(), 2),
             "retries": self._to_int(self.retries_var.get(), 3),
             "max_chars": self._to_int(self.max_chars_var.get(), proto.MAX_CHARS),

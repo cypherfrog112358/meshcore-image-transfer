@@ -188,7 +188,7 @@ Wichtige Optionen:
 | `--palette4` | Bild auf 4 Farben quantisieren (adaptiv PNG/Roh) |
 | `--pipeline N` | N Pakete ohne Einzel-ACK pro Block senden (Standard 8; 1 = klassisch) |
 | `--repair` / `--no-repair` | Fehlende Pakete per Rückfrage erneut senden (Standard an) |
-| `--repair-wait S` | Max. Wartezeit auf die Rückmeldung (Standard 30 s; auch für die Abschluss-Prüfung) |
+| `--repair-wait S` | Max. Wartezeit auf die Rückmeldung (Standard 60 s; auch für die Abschluss-Prüfung) |
 | `--repair-rounds N` | Reparaturrunden pro Block (Standard 2) |
 | `--table-full-wait S` | Pause bei voller Sendetabelle (Standard 1 s) |
 | `--table-full-retries N` | Versuche bei voller Sendetabelle (Standard 10) |

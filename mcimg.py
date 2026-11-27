@@ -269,7 +269,7 @@ async def send_prepared(
     block_repair_enabled = feedback_enabled
     no_reply_streak = 0
     no_reply_limit = 2
-    repair_wait = max(0.0, float(getattr(args, "repair_wait", 30)))
+    repair_wait = max(0.0, float(getattr(args, "repair_wait", 60)))
     repair_rounds = max(1, int(getattr(args, "repair_rounds", 2)))
     replies: dict[str, object] = {}
     # Repairs that arrive unsolicited (e.g. a bad SHA-256 at the last packet)
@@ -411,7 +411,6 @@ async def send_prepared(
                 log("  Manifest vor Abschluss-Pruefung konnte nicht gesendet werden.")
             await _pace(args)
 
-            unconfirmed_repair = False
             final_confirmed = False
             for _round in range(max(repair_rounds, 3)):
                 replies.clear()
@@ -438,7 +437,10 @@ async def send_prepared(
                 answers = list(pending_feedback)
                 pending_feedback.clear()
                 if not answers:
-                    if unconfirmed_repair and not final_confirmed:
+                    if (
+                        not final_confirmed
+                        and _round + 1 < max(repair_rounds, 3)
+                    ):
                         log("  Keine Abschlussrueckmeldung - noch eine Rueckfrage ...")
                         continue
                     log("  Keine Abschlussrueckmeldung empfangen.")
@@ -459,7 +461,6 @@ async def send_prepared(
                     log("  Abschluss-Pruefung: Empfaenger hat alle Pakete.")
                     break
 
-                unconfirmed_repair = True
                 log(f"  Abschluss-Pruefung: {len(targets)} Pakete fehlen - erneut senden")
                 for target in sorted(targets):
                     if cancelled and cancelled():
@@ -470,7 +471,7 @@ async def send_prepared(
                     else:
                         unrepaired.add(target)
 
-            if unconfirmed_repair and not final_confirmed:
+            if not final_confirmed:
                 log(
                     "WARNUNG: Abschluss nicht bestaetigt - "
                     "bitte Ausgabeordner auf dem Empfaenger pruefen."
@@ -914,8 +915,8 @@ def build_parser() -> argparse.ArgumentParser:
     send.add_argument(
         "--repair-wait",
         type=float,
-        default=30.0,
-        help="Max. Wartezeit auf eine Reparaturantwort in Sekunden (Standard: 30)",
+        default=60.0,
+        help="Max. Wartezeit auf eine Reparaturantwort in Sekunden (Standard: 60)",
     )
     send.add_argument(
         "--repair-rounds",
