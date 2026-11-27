@@ -12,20 +12,25 @@ sich ein Transfer über LoRa noch sinnvoll machen lässt.
 ## Wichtige Realität: LoRa ist langsam
 
 Ein MeshCore-Paket trägt hier etwa **86 Nutzbytes**. Ein 100-KB-JPEG sind damit
-rund **1.200 Nachrichten**. Mit der Standardpause von 300 ms sind das mindestens
-6 Minuten; die echte Funkzeit (und ggf. Duty-Cycle-Grenzen auf 868 MHz) kommt
+rund **1.200 Nachrichten**. Mit der Standardpause von 50 ms sind das mindestens
+~1 Minute; die echte Funkzeit (und ggf. Duty-Cycle-Grenzen auf 868 MHz) kommt
 noch oben drauf. Bei schlechter Verbindung oder langsamem Preset kann deutlich
 mehr Zeit vergehen. Das Programm zeigt Fortschritt und Schätzung an.
 
-| Bildgröße | Pakete (ca.) | Mindestzeit bei 300 ms Pause |
+| Bildgröße | Pakete (ca.) | Mindestzeit bei 50 ms Pause |
 |---|---:|---:|
-| 30 KB | 360 | ~2 min |
-| 100 KB | 1.200 | ~6 min |
-| 500 KB | 6.000 | ~30 min |
+| 30 KB | 360 | ~18 s |
+| 100 KB | 1.200 | ~1 min |
+| 500 KB | 6.000 | ~5 min |
 
-Die Pause kann mit `--gap-ms 0` auf 0 gesetzt werden; dann bestimmt die
-Sendeschlange des Radios das Tempo. Für zuverlässige Übertragung lieber `--ack`
-verwenden.
+Drei Tempomaßnahmen sind jetzt Standard:
+
+1. **Pause 50 ms** statt 300 ms (`--gap-ms 0` setzt sie ganz auf 0).
+2. **4-Farben-Modus** mit 2 Bit/Pixel (4 Pixel/Byte) und adaptivem PNG-Container.
+3. **Pipelining** mit 8 Paketen pro Block (`--pipeline`): der Empfänger meldet
+   nur fehlende Pakete, genau diese werden erneut gesendet (`--repair`).
+
+Einzel-ACK pro Paket (`--ack`) ist langsamer und deshalb standardmäßig aus.
 
 ## Installation
 
@@ -62,7 +67,7 @@ Die Haupt-GUI ist `mcimg_app.py` und orientiert sich an der offiziellen
 MeshCore-App: links eine Navigation, dazu die Seiten **Nachrichten**,
 **Kontakte**, **Bilder** und **Verbindung**. Sie verbindet direkt per BLE mit
 einem Companion (z. B. Heltec V4), lädt die Kontakte und bietet zusätzlich
-Bildversand und -empfang inklusive 5-Farben-Modus.
+Bildversand und -empfang inklusive 4-Farben-Modus mit Pipeline-Reparatur.
 
 ```powershell
 .\.venv\Scripts\python.exe mcimg_app.py
@@ -91,31 +96,36 @@ Kommandozeilen-naher Ersatz erhalten:
 .\.venv\Scripts\python.exe mcimg_gui.py
 ```
 
-## 5-Farben-Modus (für kleine Displays / Heltec)
+## 4-Farben-Modus (für kleine Displays / Heltec)
 
-Auf Wunsch wird das Bild **in Originalauflösung** auf fünf Helligkeitsstufen
-reduziert: Schwarz, drei Graustufen (25/50/75 %) und Weiß. Drei Pixel werden in
-ein Byte gepackt (`wert = a*25 + b*5 + c`). Aus einer 24-Bit-RGB-Datei werden
-dadurch nur noch ~0,67 Bytes pro Pixel – verkleinert wird das Bild nicht.
+Auf Wunsch wird das Bild **in Originalauflösung** auf vier Helligkeitsstufen
+reduziert: Schwarz, zwei Graustufen (33/67 %) und Weiß. Vier Pixel werden in
+ein Byte gepackt (2 Bit pro Pixel) – das sind nur noch **0,25 Bytes pro Pixel**,
+25 % weniger als zuvor mit fünf Farben. Verkleinert wird das Bild nicht.
 
 CLI:
 
 ```powershell
 .\.venv\Scripts\python.exe mcimg.py send "C:\Fotos\IMG_0001.JPG" `
-  --target "HeltecV4" --dest "Empfaenger" --palette5 --dither floyd --ack
+  --target "HeltecV4" --dest "Empfaenger" --palette4 --dither floyd
 ```
 
-In der GUI einfach **5-Farben-Modus** anhaken und ein Dither-Verfahren wählen:
+In der GUI einfach **4-Farben-Modus** anhaken und ein Dither-Verfahren wählen:
 
 - `floyd` – Floyd-Steinberg, gute Foto-Wiedergabe (Standard)
 - `ordered` – 4×4-Bayer-Matrix, ruhiger, weniger „Rauschen“
-- `none` – harte Quantisierung ohne Dither
+- `none` – harte Quantisierung, ideal für Schwarz/Weiß-Frames (z. B. Bad Apple)
 
-Der Sender packt die Pixel in einen kleinen `MC5F`-Container (Breite, Höhe,
-Dither-Modus, Pixelbytes) und verschickt ihn wie eine normale Datei. Der
-Empfänger erkennt den Container automatisch und schreibt ein **Palett-PNG** mit
-genau diesen fünf Farben in Originalgröße. Eine separate Option am Empfänger
-ist dafür nicht nötig.
+Der Sender baut zwei Varianten und verschickt die **kleinere**:
+
+- **Roh:** 2-Bit-Pixelbytes im `MC4F`-Container
+- **PNG:** indiziertes PNG mit genau vier Paletteneinträgen
+
+PNG-Filter + zlib gewinnen bei großen Flächen (Logos, Frames, Text) deutlich;
+bei stark verrauschtem Floyd-Dither gewinnt meist die Rohvariante. Der Empfänger
+erkennt den Modus automatisch und schreibt immer ein **Palett-PNG** in
+Originalgröße. Alte `MC5F`-Container aus früheren Transfers können weiterhin
+gelesen werden. Eine separate Option am Empfänger ist nicht nötig.
 
 Der Heltec V4 wird dabei wie jeder andere MeshCore-BLE-Companion behandelt:
 `--target` ist der BLE-Name/die Adresse des Heltec, `--dest` der Kontakt auf der
@@ -156,7 +166,7 @@ Fortschrittsdatei wird gelöscht.
 
 ```powershell
 .\.venv\Scripts\python.exe mcimg.py send "C:\Fotos\IMG_0001.JPG" `
-  --target "KameraNode" --dest "EmpfaengerNode" --ack
+  --target "KameraNode" --dest "EmpfaengerNode"
 ```
 
 Wichtige Optionen:
@@ -164,15 +174,24 @@ Wichtige Optionen:
 | Option | Bedeutung |
 |---|---|
 | `--dest` | Kontaktname oder Public-Key-Prefix des Empfängers (Pflicht) |
-| `--ack` | Auf die Bestätigung warten und bis zu `--retries` (3) mal erneut senden |
-| `--gap-ms` | Pause zwischen Nachrichten, Standard 300 |
+| `--palette4` | Bild auf 4 Farben quantisieren (adaptiv PNG/Roh) |
+| `--pipeline N` | N Pakete ohne Einzel-ACK pro Block senden (Standard 8; 1 = klassisch) |
+| `--repair` / `--no-repair` | Fehlende Pakete per Rückfrage erneut senden (Standard an) |
+| `--repair-wait S` | Max. Wartezeit auf die Rückmeldung (Standard 15 s) |
+| `--repair-rounds N` | Reparaturrunden pro Block (Standard 2) |
+| `--ack` | Einzel-ACK pro Paket (langsam, Standard aus) |
+| `--gap-ms` | Pause zwischen Nachrichten, Standard 50 |
 | `--manifest-repeat` | Manifest 3× senden, damit der Empfänger es sicher hat |
 | `--limit N` | Nur N Datenpakete senden (für Tests) |
 | `--report-every N` | Fortschritt alle N Pakete ausgeben |
 
 Der Transfer ist abgeschlossen, wenn der Empfänger „EMPFANGEN: ..." meldet.
-Der Sender weiß nur, dass die Pakete per ACK bestätigt wurden – die
-Prüfsumme wird beim Empfänger geprüft.
+Der SHA-256 bleibt das letzte Sicherheitsnetz: Stimmt er nach vollständigem
+Empfang nicht, fordert der Empfänger einmalig alle Pakete erneut an.
+
+Wichtig: Sender **und** Empfänger müssen diese Version verwenden, sonst kennt
+der Empfänger die Rückfragen nicht. Der Sender merkt das nach einem Block und
+schaltet automatisch auf Plain-Pipeline ohne Rückkanal um.
 
 ## Ohne Hardware testen
 
@@ -200,6 +219,8 @@ Jede Nachricht ist ASCII und höchstens 133 Zeichen lang.
 ```
 Manifest:  I1:M:<id>:<groesse36>:<pakete36>:<sha256>:<ext>:<name_b64>
 Daten:     I1:D:<id>:<seq36>:<chunk_b64>
+Rückfrage: I1:Q:<id>:<von36>:<bis36>:
+Antwort:   I1:R:<id>:<seq36,seq36,...>:   (oder * = alles erneut)
 ```
 
 - `id` = erste 8 Hex-Zeichen des SHA-256 der Datei (stabil bei Neustarts)

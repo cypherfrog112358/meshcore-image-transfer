@@ -4,7 +4,7 @@
 This GUI follows the layout of the official MeshCore desktop app: a navigation
 rail, contact list, chat view and a connection page. It connects directly via
 BLE to a MeshCore companion such as the Heltec V4 and adds image transfer,
-including the 5-colour mode, as extra features.
+including the adaptive 4-colour mode, as extra features.
 
 Start with::
 
@@ -46,6 +46,7 @@ class RadioSession:
         self.mc = None
         self.receiver: mcimg.Receiver | None = None
         self.devices: list[dict] = []
+        self.reply_key: str | None = None
 
     # ------------------------------------------------------------- loop --
 
@@ -241,6 +242,8 @@ class RadioSession:
         payload = event.payload or {}
         text = payload.get("text", "") or ""
         prefix = payload.get("pubkey_prefix") or ""
+        if prefix:
+            self.reply_key = prefix
         self.emit(
             "message",
             {"prefix": prefix, "name": self._name_for(prefix), "text": text},
@@ -318,9 +321,14 @@ class RadioSession:
             dest=key,
             transport="ble",
             max_chars=options["max_chars"],
-            palette5=options["palette5"],
+            palette4=options["palette4"],
+            palette5=False,
             dither=options["dither"],
             gap_ms=options["gap_ms"],
+            pipeline=options["pipeline"],
+            repair=options["repair"],
+            repair_wait=options["repair_wait"],
+            repair_rounds=options["repair_rounds"],
             ack=options["ack"],
             retries=options["retries"],
             manifest_repeat=3,
@@ -352,12 +360,21 @@ class RadioSession:
             save_every=10**9,
         )
         receiver = mcimg.Receiver(args)
+        self.reply_key = sender_key or None
         if sender_key:
             try:
                 contact = self._contact(sender_key)
                 receiver.sender_filter = contact.get("public_key", "")[:12]
             except RuntimeError:
                 receiver.sender_filter = sender_key.lower()
+
+        def feedback(text: str) -> None:
+            key = self.reply_key or sender_key
+            if not key or self.mc is None:
+                return
+            asyncio.create_task(self.send_text(key, text, False, 1))
+
+        receiver.feedback = feedback
         self.receiver = receiver
         self.emit("status", "Bildempfang aktiv")
 
@@ -408,16 +425,28 @@ class App:
             "target": "HeltecV4",
             "pin": "",
             "out": str(Path.home() / "MeshCore-Bilder"),
-            "palette5": True,
+            "palette4": True,
             "dither": "floyd",
-            "gap_ms": 300,
+            "gap_ms": 50,
+            "pipeline": 8,
+            "repair": True,
+            "repair_wait": 15,
+            "repair_rounds": 2,
             "retries": 3,
             "max_chars": proto.MAX_CHARS,
-            "ack": True,
+            "ack": False,
         }
         try:
             if CONFIG_PATH.is_file():
-                defaults.update(json.loads(CONFIG_PATH.read_text(encoding="utf-8")))
+                stored = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+                if "palette5" in stored:
+                    # Old settings: move to 4 colours and the fast defaults.
+                    stored["palette4"] = stored["palette5"]
+                    if stored.get("gap_ms") == 300:
+                        stored["gap_ms"] = 50
+                    stored["ack"] = False
+                stored.pop("palette5", None)
+                defaults.update(stored)
         except (OSError, ValueError):
             pass
         return defaults
@@ -427,9 +456,13 @@ class App:
             "target": self._selected_address(),
             "pin": self.pin_var.get().strip(),
             "out": self.out_var.get().strip(),
-            "palette5": self.palette5_var.get(),
+            "palette4": self.palette4_var.get(),
             "dither": self.dither_var.get(),
-            "gap_ms": self._to_int(self.gap_var.get(), 300),
+            "gap_ms": self._to_int(self.gap_var.get(), 50),
+            "pipeline": self._to_int(self.pipeline_var.get(), 8),
+            "repair": self.repair_var.get(),
+            "repair_wait": self._to_int(self.repair_wait_var.get(), 15),
+            "repair_rounds": self._to_int(self.repair_rounds_var.get(), 2),
             "retries": self._to_int(self.retries_var.get(), 3),
             "max_chars": self._to_int(self.max_chars_var.get(), proto.MAX_CHARS),
             "ack": self.ack_var.get(),
@@ -722,11 +755,11 @@ class App:
         self.image_dest_box = ttk.Combobox(send, textvariable=self.image_dest_var, width=30)
         self.image_dest_box.grid(row=1, column=1, sticky="ew")
 
-        self.palette5_var = tk.BooleanVar(value=bool(self.cfg["palette5"]))
+        self.palette4_var = tk.BooleanVar(value=bool(self.cfg["palette4"]))
         ttk.Checkbutton(
             send,
-            text="5-Farben-Modus (Schwarz + 3 Grau + Weiß)",
-            variable=self.palette5_var,
+            text="4-Farben-Modus (Schwarz + 2 Grau + Weiß, adaptiv PNG)",
+            variable=self.palette4_var,
         ).grid(row=2, column=1, sticky="w", pady=6)
 
         ttk.Label(send, text="Dither:").grid(row=3, column=0, sticky="w", pady=3)
@@ -738,8 +771,11 @@ class App:
 
         for row, label, var, default, to in (
             (4, "Pause (ms):", "gap_var", self.cfg["gap_ms"], 60000),
-            (5, "Versuche:", "retries_var", self.cfg["retries"], 10),
-            (6, "Zeichen/Nachricht:", "max_chars_var", self.cfg["max_chars"], 133),
+            (5, "Pipeline (Pakete):", "pipeline_var", self.cfg["pipeline"], 64),
+            (6, "Warte auf Reparatur (s):", "repair_wait_var", self.cfg["repair_wait"], 300),
+            (7, "Reparaturrunden:", "repair_rounds_var", self.cfg["repair_rounds"], 10),
+            (8, "Versuche:", "retries_var", self.cfg["retries"], 10),
+            (9, "Zeichen/Nachricht:", "max_chars_var", self.cfg["max_chars"], 133),
         ):
             ttk.Label(send, text=label).grid(row=row, column=0, sticky="w", pady=3)
             string_var = tk.StringVar(value=str(default))
@@ -748,13 +784,17 @@ class App:
                 row=row, column=1, sticky="w"
             )
 
+        self.repair_var = tk.BooleanVar(value=bool(self.cfg["repair"]))
+        ttk.Checkbutton(
+            send, text="Fehlende Pakete nachfragen (schnell)", variable=self.repair_var
+        ).grid(row=10, column=1, sticky="w", pady=2)
         self.ack_var = tk.BooleanVar(value=bool(self.cfg["ack"]))
-        ttk.Checkbutton(send, text="Auf ACK warten", variable=self.ack_var).grid(
-            row=7, column=1, sticky="w", pady=4
+        ttk.Checkbutton(send, text="ACK pro Paket (langsam)", variable=self.ack_var).grid(
+            row=11, column=1, sticky="w", pady=2
         )
 
         buttons = ttk.Frame(send)
-        buttons.grid(row=8, column=1, sticky="w", pady=(14, 0))
+        buttons.grid(row=12, column=1, sticky="w", pady=(14, 0))
         self.send_image_btn = ttk.Button(buttons, text="Bild senden", command=self.do_send_image)
         self.send_image_btn.pack(side="left")
         self.stop_image_btn = ttk.Button(
@@ -1021,9 +1061,13 @@ class App:
         self.stop_image_btn.configure(state="normal")
         self.status_var.set("Bild wird vorbereitet ...")
         options = {
-            "palette5": self.palette5_var.get(),
+            "palette4": self.palette4_var.get(),
             "dither": self.dither_var.get(),
-            "gap_ms": self._to_int(self.gap_var.get(), 300),
+            "gap_ms": self._to_int(self.gap_var.get(), 50),
+            "pipeline": self._to_int(self.pipeline_var.get(), 8),
+            "repair": self.repair_var.get(),
+            "repair_wait": self._to_int(self.repair_wait_var.get(), 15),
+            "repair_rounds": self._to_int(self.repair_rounds_var.get(), 2),
             "retries": self._to_int(self.retries_var.get(), 3),
             "max_chars": self._to_int(self.max_chars_var.get(), proto.MAX_CHARS),
             "ack": self.ack_var.get(),

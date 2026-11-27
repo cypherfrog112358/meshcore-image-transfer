@@ -1,8 +1,10 @@
 import argparse
 import io
 import random
+import struct
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from PIL import Image
 
@@ -99,18 +101,78 @@ class ProtocolTests(unittest.TestCase):
         with self.assertRaises(proto.ProtocolError):
             proto.parse_message("I1:X:abc")
 
+    def test_query_and_repair_roundtrip(self):
+        tid = "deadbeef"
+        query = proto.parse_message(proto.encode_query(tid, 7, 12))
+        self.assertIsInstance(query, proto.Query)
+        self.assertEqual((query.transfer_id, query.start, query.end), (tid, 7, 12))
+
+        repair = proto.parse_message(proto.encode_repair(tid, [3, 7, 12, 3]))
+        self.assertIsInstance(repair, proto.Repair)
+        self.assertEqual(repair.missing, [3, 7, 12])
+        self.assertFalse(repair.resend_all)
+
+        empty = proto.parse_message(proto.encode_repair(tid, []))
+        self.assertEqual(empty.missing, [])
+
+        full = proto.parse_message(proto.encode_repair(tid, [], resend_all=True))
+        self.assertTrue(full.resend_all)
+
+    def test_repair_message_stays_short(self):
+        tid = "deadbeef"
+        text = proto.encode_repair(tid, list(range(500)), max_chars=40)
+        self.assertLessEqual(len(text), 40)
+        self.assertTrue(text.startswith(f"I1:R:{tid}:"))
+
+    def test_receiver_answers_query(self):
+        data = b"abc" * 300
+        manifest = proto.make_manifest(data, "x.jpg")
+        messages = proto.make_data_messages(data, manifest)
+        answers = []
+
+        with tempfile.TemporaryDirectory() as tmp:
+            receiver = receiver_for(tmp)
+            receiver.feedback = answers.append
+            receiver.handle(proto.encode_manifest(manifest))
+            receiver.handle(messages[0])
+            receiver.handle(messages[2])
+            receiver.handle(proto.encode_query(manifest.transfer_id, 0, 3))
+
+        self.assertEqual(len(answers), 1)
+        reply = proto.parse_message(answers[0])
+        self.assertIsInstance(reply, proto.Repair)
+        self.assertEqual(reply.missing, [1, 3])
+
+    def test_bad_checksum_requests_full_resend(self):
+        data = b"abc" * 300
+        manifest = proto.make_manifest(data, "x.jpg")
+        broken = replace(manifest, sha256="0" * 64)
+        messages = proto.make_data_messages(data, manifest)
+        answers = []
+
+        with tempfile.TemporaryDirectory() as tmp:
+            receiver = receiver_for(tmp)
+            receiver.feedback = answers.append
+            receiver.handle(proto.encode_manifest(broken))
+            for text in messages:
+                receiver.handle(text)
+
+        self.assertEqual(len(answers), 1)
+        reply = proto.parse_message(answers[0])
+        self.assertTrue(reply.resend_all)
+
 
 class PaletteTests(unittest.TestCase):
     def test_pack_unpack(self):
-        values = [0, 1, 2, 3, 4, 0, 4, 2, 1]
+        values = [0, 1, 2, 3, 0, 3, 2, 1]
         packed = palette.pack_indices(values)
-        self.assertEqual(len(packed), 3)
+        self.assertEqual(len(packed), 2)
         self.assertEqual(palette.unpack_indices(packed, len(values)), values)
 
     def test_levels(self):
-        values = bytes((0, 31, 32, 63, 64, 95, 96, 127, 128, 191, 192, 255))
+        values = bytes((0, 42, 43, 127, 128, 212, 213, 255))
         result = palette.quantize(values, len(values), 1, "none")
-        self.assertEqual(result, [0, 0, 1, 1, 1, 1, 2, 2, 2, 3, 3, 4])
+        self.assertEqual(result, [0, 0, 1, 1, 2, 2, 3, 3])
 
     def test_image_to_png(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -124,18 +186,39 @@ class PaletteTests(unittest.TestCase):
             for dither in palette.DITHER_MODES:
                 with self.subTest(dither=dither):
                     container = palette.image_to_container(src, dither)
-                    width, height, mode, packed = palette.parse_container(container)
+                    width, height, mode, payload_mode, payload = palette.parse_container(container)
                     self.assertEqual((width, height), (23, 11))
-                    self.assertEqual(len(palette.unpack_indices(packed, width * height)), 23 * 11)
+                    self.assertEqual(mode, dither)
+                    self.assertIn(payload_mode, (palette.MODE_RAW, palette.MODE_PNG))
+                    if payload_mode == palette.MODE_RAW:
+                        indices = palette.unpack_indices(payload, width * height)
+                        self.assertEqual(len(indices), 23 * 11)
+                    else:
+                        self.assertTrue(payload.startswith(b"\x89PNG"))
                     with Image.open(io.BytesIO(palette.container_to_png(container))) as png:
                         self.assertEqual(png.size, (23, 11))
                         self.assertEqual(png.mode, "P")
                         colors = png.convert("RGB").getcolors(maxcolors=10)
                     self.assertIsNotNone(colors)
-                    self.assertLessEqual(len(colors), 5)
+                    self.assertLessEqual(len(colors), 4)
                     for _count, color in colors:
                         self.assertEqual(color, (color[0],) * 3)
                         self.assertIn(color[0], palette.LEVELS)
+
+    def test_adaptive_payload_choice(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            flat = Path(tmp) / "flat.png"
+            Image.new("L", (120, 120), 255).save(flat)
+            flat_container = palette.image_to_container(flat, "none")
+            self.assertEqual(palette.parse_container(flat_container)[3], palette.MODE_PNG)
+
+            noisy = Path(tmp) / "noisy.png"
+            image = Image.new("L", (120, 120))
+            rng = random.Random(12)
+            image.putdata([rng.randrange(4) * 85 for _ in range(120 * 120)])
+            image.save(noisy)
+            noisy_container = palette.image_to_container(noisy, "none")
+            self.assertEqual(palette.parse_container(noisy_container)[3], palette.MODE_RAW)
 
     def test_receiver_writes_png(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -143,7 +226,7 @@ class PaletteTests(unittest.TestCase):
             image = Image.new("RGB", (8, 6), (110, 130, 150))
             image.save(src)
             container = palette.image_to_container(src, "none")
-            manifest = proto.make_manifest(container, "src.mc5")
+            manifest = proto.make_manifest(container, "src.mc4")
             messages = proto.make_data_messages(container, manifest)
 
             receiver = receiver_for(tmp)
@@ -155,6 +238,17 @@ class PaletteTests(unittest.TestCase):
             with Image.open(output) as result:
                 self.assertEqual(result.size, (8, 6))
                 self.assertEqual(result.mode, "P")
+
+    def test_legacy_mc5_container(self):
+        width, height = 4, 2
+        packed = bytes((0, 25 * 4 + 5 * 3 + 2))
+        container = struct.pack(
+            "<4sBBII", palette.LEGACY_MAGIC, 1, 0, width, height
+        ) + packed * 2
+        png = palette.container_to_png(container)
+        with Image.open(io.BytesIO(png)) as image:
+            self.assertEqual(image.size, (width, height))
+            self.assertLessEqual(len(image.convert("RGB").getcolors()), 5)
 
 
 if __name__ == "__main__":

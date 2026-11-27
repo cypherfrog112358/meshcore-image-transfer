@@ -116,7 +116,7 @@ class App:
         self.dest_box.grid(row=1, column=1, sticky="ew")
 
         ttk.Label(send_tab, text="Pause zwischen Paketen (ms):").grid(row=2, column=0, sticky="w", pady=4)
-        self.gap_var = tk.StringVar(value="300")
+        self.gap_var = tk.StringVar(value="50")
         ttk.Spinbox(send_tab, textvariable=self.gap_var, from_=0, to=60000, width=10).grid(
             row=2, column=1, sticky="w"
         )
@@ -138,11 +138,11 @@ class App:
             row=5, column=1, sticky="w"
         )
 
-        self.palette5_var = tk.BooleanVar(value=False)
+        self.palette4_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(
             send_tab,
-            text="5-Farben-Modus (Schwarz + 3 Grau + Weiss, Originalaufloesung)",
-            variable=self.palette5_var,
+            text="4-Farben-Modus (Schwarz + 2 Grau + Weiss, Originalaufloesung)",
+            variable=self.palette4_var,
         ).grid(row=6, column=1, sticky="w", pady=(6, 2))
 
         ttk.Label(send_tab, text="Dither:").grid(row=7, column=0, sticky="w", pady=2)
@@ -227,7 +227,7 @@ class App:
 
     def _send_args(self) -> types.SimpleNamespace:
         args = self._connection_args()
-        defaults = {"gap_ms": 300, "retries": 3, "max_chars": proto.MAX_CHARS}
+        defaults = {"gap_ms": 50, "retries": 3, "max_chars": proto.MAX_CHARS}
         for name, var in (
             ("gap_ms", self.gap_var),
             ("retries", self.retries_var),
@@ -240,7 +240,11 @@ class App:
         args.file = self.file_var.get().strip()
         args.dest = self.dest_var.get().strip()
         args.ack = self.ack_var.get()
-        args.palette5 = self.palette5_var.get()
+        args.palette4 = self.palette4_var.get()
+        args.pipeline = 8
+        args.repair = True
+        args.repair_wait = 15.0
+        args.repair_rounds = 2
         args.dither = self.dither_var.get()
         if args.dither not in palette.DITHER_MODES:
             args.dither = "floyd"

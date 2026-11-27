@@ -175,14 +175,11 @@ def prepare_transfer(
         raise SystemExit(f"Datei nicht gefunden: {path}")
 
     transfer_name = path.name
-    if args.palette5:
+    palette_mode = getattr(args, "palette4", False) or getattr(args, "palette5", False)
+    if palette_mode:
         data = palette.image_to_container(path, args.dither)
-        width, height, dither, _packed = palette.parse_container(data)
-        transfer_name = path.stem + ".mc5"
-        log(
-            f"5-Farben-Modus: {width}x{height} Pixel, Dither {dither}, "
-            f"{len(data)} Bytes gepackt (3 Pixel/Byte)"
-        )
+        transfer_name = path.stem + ".mc4"
+        log(f"4-Farben-Modus: {palette.container_info(data)}")
     else:
         data = path.read_bytes()
 
@@ -200,6 +197,8 @@ def prepare_transfer(
     log(f"Pakete:     {len(messages)} + {args.manifest_repeat}x Manifest")
     log(f"Nutzdaten:  ~{chunk_size} Bytes/Paket, {args.max_chars} Zeichen/Paket")
     estimate = len(messages) * (args.gap_ms / 1000)
+    if getattr(args, "pipeline", 1) > 1:
+        log(f"Pipeline: {args.pipeline} Pakete pro Block (Reparatur bei Rueckkanal)")
     log(f"Mindestzeit durch Pausen: {human_time(estimate)} (Funkzeit kommt dazu)")
     if len(messages) > 5000:
         log("Hinweis: Bei LoRa kann das sehr lange dauern. Siehe README.md.")
@@ -217,36 +216,130 @@ async def send_prepared(
 ) -> int:
     """Send prepared messages over an existing connection (no disconnect)."""
     started = time.monotonic()
-    failed = 0
+    unrepaired: set[int] = set()
     stopped = False
-    for _ in range(args.manifest_repeat):
-        if cancelled and cancelled():
-            stopped = True
-            break
-        text = proto.encode_manifest(manifest, args.max_chars)
-        if not await send_text(mc, contact, args, text):
-            failed += 1
+    pipeline = max(1, int(getattr(args, "pipeline", 1)))
+    repair_active = (
+        pipeline > 1
+        and bool(getattr(args, "repair", True))
+        and mc is not None
+        and contact is not None
+    )
+    repair_wait = max(0.0, float(getattr(args, "repair_wait", 15)))
+    repair_rounds = max(1, int(getattr(args, "repair_rounds", 2)))
+    replies: dict[str, proto.Repair] = {}
+    subscription = None
+
+    if repair_active:
+        from meshcore import EventType
+
+        def on_reply(event) -> None:
+            payload = event.payload or {}
+            try:
+                parsed = proto.parse_message(payload.get("text", "") or "")
+            except proto.ProtocolError:
+                return
+            if (
+                isinstance(parsed, proto.Repair)
+                and parsed.transfer_id == manifest.transfer_id
+            ):
+                replies["value"] = parsed
+
+        subscription = mc.subscribe(EventType.CONTACT_MSG_RECV, on_reply)
+
+    async def send_one(seq: int) -> bool:
+        ok = await send_text(mc, contact, args, messages[seq])
         if args.gap_ms:
             await asyncio.sleep(args.gap_ms / 1000)
+        return ok
 
-    for seq, text in enumerate(messages):
-        if cancelled and cancelled():
-            stopped = True
-            break
-        if not await send_text(mc, contact, args, text):
-            failed += 1
-        if args.gap_ms:
-            await asyncio.sleep(args.gap_ms / 1000)
+    try:
+        for _ in range(args.manifest_repeat):
+            if cancelled and cancelled():
+                stopped = True
+                break
+            if not await send_text(
+                mc, contact, args, proto.encode_manifest(manifest, args.max_chars)
+            ):
+                log("  Manifest konnte nicht gesendet werden.")
+            if args.gap_ms:
+                await asyncio.sleep(args.gap_ms / 1000)
 
-        if (seq + 1) % args.report_every == 0 or seq + 1 == len(messages):
-            elapsed = time.monotonic() - started
-            rate = (seq + 1) / elapsed if elapsed else 0
-            eta = (len(messages) - seq - 1) / rate if rate else float("inf")
-            log(
-                f"  {seq + 1}/{len(messages)} Pakete  "
-                f"({rate:.2f}/s, verbleibend ~{human_time(eta)}, fehlgeschlagen: {failed})"
-            )
+        seq = 0
+        while not stopped and seq < len(messages):
+            batch_end = min(len(messages), seq + pipeline)
+            local_failed: set[int] = set()
 
+            for current in range(seq, batch_end):
+                if cancelled and cancelled():
+                    stopped = True
+                    break
+                if await send_one(current):
+                    unrepaired.discard(current)
+                else:
+                    local_failed.add(current)
+                    unrepaired.add(current)
+
+            # Instead of waiting for an ACK after every packet, ask the
+            # receiver once per block which packets it actually missed.
+            if repair_active:
+                for _round in range(repair_rounds):
+                    replies.pop("value", None)
+                    query = proto.encode_query(manifest.transfer_id, seq, batch_end - 1)
+                    if not await send_text(mc, contact, args, query):
+                        log("  Rueckfrage konnte nicht gesendet werden.")
+                    deadline = time.monotonic() + repair_wait
+                    while "value" not in replies and time.monotonic() < deadline:
+                        if cancelled and cancelled():
+                            stopped = True
+                            break
+                        await asyncio.sleep(0.2)
+                    if stopped:
+                        break
+
+                    reply = replies.pop("value", None)
+                    if reply is None:
+                        log("  Keine Reparaturrueckmeldung - Pipeline ohne Rueckkanal.")
+                        repair_active = False
+                        break
+
+                    if reply.resend_all:
+                        targets = set(range(seq, batch_end))
+                    else:
+                        targets = {s for s in reply.missing if seq <= s < batch_end}
+                    targets |= local_failed
+                    if not targets:
+                        break
+
+                    for target in sorted(targets):
+                        if cancelled and cancelled():
+                            stopped = True
+                            break
+                        if await send_one(target):
+                            local_failed.discard(target)
+                            unrepaired.discard(target)
+                        else:
+                            unrepaired.add(target)
+
+            if stopped:
+                break
+            if args.report_every and (
+                batch_end % args.report_every == 0 or batch_end == len(messages)
+            ):
+                elapsed = time.monotonic() - started
+                rate = batch_end / elapsed if elapsed else 0
+                eta = (len(messages) - batch_end) / rate if rate else float("inf")
+                log(
+                    f"  {batch_end}/{len(messages)} Pakete  "
+                    f"({rate:.2f}/s, verbleibend ~{human_time(eta)}, "
+                    f"fehlgeschlagen: {len(unrepaired)})"
+                )
+            seq = batch_end
+    finally:
+        if subscription is not None and mc is not None:
+            mc.unsubscribe(subscription)
+
+    failed = len(unrepaired)
     if stopped:
         log("Senden abgebrochen.")
         return 130
@@ -270,6 +363,9 @@ class Receiver:
         self.manifest: proto.Manifest | None = None
         self.sender_filter: str | None = None
         self.completed_ids: set[str] = set()
+        #: Optional callback used to answer pipeline repair queries.
+        self.feedback: Callable[[str], None] | None = None
+        self._asked_resend: set[str] = set()
 
     def _progress_path(self, manifest: proto.Manifest) -> Path:
         return self.out_dir / manifest.progress_name
@@ -335,20 +431,27 @@ class Receiver:
         assert self.manifest is not None
         payload = b"".join(self.chunks[i] for i in range(self.manifest.chunks))
         if not proto.verify(payload, self.manifest):
-            log("  Pruefsumme stimmt (noch) nicht - warte auf fehlende Pakete.")
+            log("  Pruefsumme stimmt nicht - alle Pakete erneut anfordern.")
+            if self.feedback and self.manifest.transfer_id not in self._asked_resend:
+                self._asked_resend.add(self.manifest.transfer_id)
+                # Drop the bad copies so the retransmitted packets replace them.
+                self.chunks.clear()
+                self._progress_path(self.manifest).unlink(missing_ok=True)
+                self.feedback(
+                    proto.encode_repair(self.manifest.transfer_id, [], resend_all=True)
+                )
             return
 
         name = self._final_name(self.manifest)
         output = payload
-        if payload.startswith(palette.MAGIC):
+        if palette.is_container(payload):
             try:
                 output = palette.container_to_png(payload)
             except palette.PaletteError as exc:
-                log(f"  MC5-Bild konnte nicht gebaut werden: {exc}")
+                log(f"  Palettenbild konnte nicht gebaut werden: {exc}")
                 return
             name = str(Path(name).with_suffix(".png"))
-            width, height, _mode, _packed = palette.parse_container(payload)
-            log(f"  5-Farben-Bild: {width}x{height} Pixel -> Palett-PNG")
+            log(f"  {palette.container_info(payload)} -> PNG")
 
         target = self.out_dir / name
         counter = 1
@@ -377,6 +480,21 @@ class Receiver:
 
         if self.args.id and parsed.transfer_id != self.args.id:
             return
+
+        if isinstance(parsed, proto.Query):
+            if self.feedback is None or (
+                self.manifest is not None
+                and parsed.transfer_id != self.manifest.transfer_id
+            ):
+                return
+            total = self.manifest.chunks if self.manifest else parsed.end + 1
+            end = min(parsed.end, total - 1)
+            missing = [
+                seq for seq in range(parsed.start, end + 1) if seq not in self.chunks
+            ]
+            self.feedback(proto.encode_repair(parsed.transfer_id, missing))
+            return
+
         if parsed.transfer_id in self.completed_ids:
             return
 
@@ -455,14 +573,27 @@ async def cmd_recv(
     mc = await connect(args)
     from meshcore import EventType
 
+    reply_contact = {"value": None}
     if args.sender:
         res = await mc.commands.get_contacts()
         if res.type == EventType.ERROR:
             raise RuntimeError(f"Kontakte konnten nicht gelesen werden: {res.payload}")
         contact = mc.get_contact_by_name(args.sender) or mc.get_contact_by_key_prefix(args.sender)
+        reply_contact["value"] = contact
         receiver.sender_filter = (
             contact["public_key"][:12] if contact else args.sender.lower()
         )
+
+    async def send_feedback(text: str) -> None:
+        target = reply_contact["value"]
+        if target is None:
+            return
+        try:
+            await mc.commands.send_msg(target, text)
+        except Exception as exc:  # noqa: BLE001 - radio APIs raise many types
+            log(f"  Reparaturrueckmeldung fehlgeschlagen: {exc}")
+
+    receiver.feedback = lambda text: asyncio.create_task(send_feedback(text))
 
     log(f"{BANNER}")
     log(f"Empfaenger aktiv ({args.transport}), Ausgabe: {out_dir}")
@@ -470,9 +601,12 @@ async def cmd_recv(
 
     async def on_message(event) -> None:
         payload = event.payload or {}
+        prefix = payload.get("pubkey_prefix")
+        if prefix and reply_contact["value"] is None:
+            reply_contact["value"] = mc.get_contact_by_key_prefix(prefix)
         receiver.handle(
             payload.get("text", ""),
-            payload.get("pubkey_prefix"),
+            prefix,
         )
 
     mc.subscribe(EventType.CONTACT_MSG_RECV, on_message)
@@ -606,17 +740,45 @@ def build_parser() -> argparse.ArgumentParser:
     transport_options(send)
     send.add_argument("--max-chars", type=int, default=proto.MAX_CHARS, help="Zeichen pro Nachricht")
     send.add_argument(
-        "--palette5",
+        "--palette4",
         action="store_true",
-        help="Bild auf 5 Helligkeitsstufen quantisieren (3 Grau + Schwarz/Weiss)",
+        help="Bild auf 4 Helligkeitsstufen quantisieren (2 Grau + Schwarz/Weiss); "
+        "adaptiv als PNG oder 2-Bit-Rohdaten",
+    )
+    send.add_argument(
+        "--palette5", action="store_true", help=argparse.SUPPRESS  # alter Alias
     )
     send.add_argument(
         "--dither",
         choices=palette.DITHER_MODES,
         default="floyd",
-        help="Dither-Verfahren fuer 5-Farben-Modus (Standard: floyd)",
+        help="Dither-Verfahren fuer 4-Farben-Modus (Standard: floyd)",
     )
-    send.add_argument("--gap-ms", type=int, default=300, help="Pause zwischen Nachrichten")
+    send.add_argument("--gap-ms", type=int, default=50, help="Pause zwischen Nachrichten")
+    send.add_argument(
+        "--pipeline",
+        type=int,
+        default=8,
+        help="Pakete pro Block ohne Einzel-ACK (1 = klassisch, Standard: 8)",
+    )
+    send.add_argument(
+        "--repair",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Fehlende Pakete per Rueckfrage nachsenden (Standard: an)",
+    )
+    send.add_argument(
+        "--repair-wait",
+        type=float,
+        default=15.0,
+        help="Max. Wartezeit auf eine Reparaturantwort in Sekunden",
+    )
+    send.add_argument(
+        "--repair-rounds",
+        type=int,
+        default=2,
+        help="Reparaturrunden pro Block (Standard: 2)",
+    )
     send.add_argument("--ack", action="store_true", help="Auf ACK warten und erneut senden")
     send.add_argument("--retries", type=int, default=3, help="Versuche pro Paket mit --ack")
     send.add_argument("--manifest-repeat", type=int, default=3, help="Manifest-Wiederholungen")

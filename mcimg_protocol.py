@@ -15,6 +15,12 @@ Data chunk::
 
     I1:D:<id>:<seq36>:<chunk_b64>
 
+Optional pipeline feedback (receiver -> sender and back)::
+
+    I1:Q:<id>:<from36>:<to36>:    sender asks which packets are missing
+    I1:R:<id>:<seq36,seq36,...>:  receiver answers with missing packet numbers
+    I1:R:<id>:*:                  receiver asks for the whole file again
+
 ``id`` is the first 8 hex chars of the file's SHA-256, so it is stable across
 restarts. Integers are encoded base36 without leading zeros. Base64 is standard
 base64 with ``=`` padding removed (add it again when decoding).
@@ -38,6 +44,8 @@ _MANIFEST_RE = re.compile(
     r"([0-9a-f]{64}):([a-z0-9]{1,8}):([A-Za-z0-9+/]*)$"
 )
 _DATA_RE = re.compile(r"^I1:D:([0-9a-f]{8}):([0-9a-z]+):([A-Za-z0-9+/]*)$")
+_QUERY_RE = re.compile(r"^I1:Q:([0-9a-f]{8}):([0-9a-z]+):([0-9a-z]+):$")
+_REPAIR_RE = re.compile(r"^I1:R:([0-9a-f]{8}):([0-9a-z,]*|\*):$")
 
 
 class ProtocolError(ValueError):
@@ -67,6 +75,24 @@ class DataChunk:
     transfer_id: str
     seq: int
     data: bytes
+
+
+@dataclass(frozen=True)
+class Query:
+    """Ask the receiver which packets in a range are still missing."""
+
+    transfer_id: str
+    start: int
+    end: int  # inclusive
+
+
+@dataclass(frozen=True)
+class Repair:
+    """Receiver's answer: missing sequence numbers, or a full resend."""
+
+    transfer_id: str
+    missing: list[int]
+    resend_all: bool = False
 
 
 def b36(value: int) -> str:
@@ -182,7 +208,30 @@ def make_data_messages(data: bytes, manifest: Manifest, max_chars: int = MAX_CHA
     return messages
 
 
-def parse_message(text: str) -> Manifest | DataChunk | None:
+def encode_query(transfer_id: str, start: int, end: int) -> str:
+    """Build a request for the missing packets in ``start..end``."""
+    return f"I1:Q:{transfer_id}:{b36(start)}:{b36(end)}:"
+
+
+def encode_repair(
+    transfer_id: str,
+    missing: list[int],
+    max_chars: int = MAX_CHARS,
+    resend_all: bool = False,
+) -> str:
+    """Build a repair answer. Falls back to ``*`` if the list is too long."""
+    header = f"I1:R:{transfer_id}:"
+    entries = [b36(seq) for seq in sorted(set(missing))]
+    body = ",".join(entries)
+    while body and len(header) + len(body) + 1 > max_chars:
+        entries.pop()
+        body = ",".join(entries)
+    if body != "*" and (resend_all or (not body and missing)):
+        body = "*"
+    return header + body + ":"
+
+
+def parse_message(text: str) -> Manifest | DataChunk | Query | Repair | None:
     """Parse a MeshCore text message. Returns None for unrelated messages."""
     if not isinstance(text, str) or not text.startswith("I1:"):
         return None
@@ -209,6 +258,25 @@ def parse_message(text: str) -> Manifest | DataChunk | None:
             return DataChunk(tid, unb36(seq), b64decode(body))
         except (ProtocolError, ValueError) as exc:
             raise ProtocolError(f"ungueltiger Datensatz: {exc}") from exc
+
+    match = _QUERY_RE.fullmatch(text)
+    if match:
+        tid, start, end = match.groups()
+        try:
+            return Query(tid, unb36(start), unb36(end))
+        except (ProtocolError, ValueError) as exc:
+            raise ProtocolError(f"ungueltige Abfrage: {exc}") from exc
+
+    match = _REPAIR_RE.fullmatch(text)
+    if match:
+        tid, body = match.groups()
+        if body == "*":
+            return Repair(tid, [], resend_all=True)
+        try:
+            missing = [unb36(part) for part in body.split(",") if part]
+        except (ProtocolError, ValueError) as exc:
+            raise ProtocolError(f"ungueltige Reparaturantwort: {exc}") from exc
+        return Repair(tid, missing)
 
     if text.startswith("I1:"):
         raise ProtocolError("I1-Nachricht mit unbekanntem Typ")
